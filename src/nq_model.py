@@ -3,8 +3,7 @@ from typing import Dict, Optional
 import torch
 from allennlp.data import Vocabulary
 from allennlp.models import Model
-from allennlp.modules import TextFieldEmbedder, Seq2SeqEncoder
-from allennlp.modules.span_extractors import EndpointSpanExtractor, SpanExtractor
+from allennlp.modules import TextFieldEmbedder, Seq2SeqEncoder, FeedForward
 from allennlp.nn import InitializerApplicator
 from allennlp.nn.util import get_text_field_mask
 from allennlp.training.metrics import CategoricalAccuracy, FBetaMeasure, F1Measure, Metric
@@ -13,26 +12,19 @@ from torch import nn, Tensor
 # from components.data.metrics.instance_wise_accuracy import InstanceWiseCategoricalAccuracy
 from torch.nn import CrossEntropyLoss
 
-from al2_implementation.ner_as_qa_f1_measure import NerAsQaSpanF1
 
 TensorDict = Dict[str, torch.Tensor]
 
 # TODO: support nested entities
-@Model.register("ner_as_mrc")
-class NerAsQaModel(Model):
+@Model.register("natural_questions")
+class NaturalQuestionsModel(Model):
     def __init__(
         self,
         word_embeddings: TextFieldEmbedder,
         encoder: Seq2SeqEncoder,
         vocab: Vocabulary,
-        metrics: Dict[str, Metric],
-        # hidden_dim: int = 128,
-        # dropout: float = 0.1,
-        # f1_average: str = "micro",
-        # # Loss-specific params
-        # target_namespace: str = "labels",
-        # target_label: Optional[str] = None,
-        # smooth: bool = False,
+
+        metrics: Dict[str, Metric] = None,
         initializer: InitializerApplicator = InitializerApplicator(),
     ) -> None:
 
@@ -40,15 +32,22 @@ class NerAsQaModel(Model):
         self.word_embeddings = word_embeddings
         self.encoder = encoder
         hidden_dim = self.encoder.get_output_dim()
-        self.span_starts = nn.Linear(hidden_dim, 2)
-        self.span_ends = nn.Linear(hidden_dim, 2)
-        self._loss_fn = CrossEntropyLoss()
+        self.span_starts = nn.Linear(hidden_dim, 1)
+        self.span_ends = nn.Linear(hidden_dim, 1)
+        self._target_namespace = 'answer_labels'
+        self.label_head = nn.Sequential(
+            nn.Linear(encoder.get_output_dim(), 32),
+            nn.Dropout(0.3),
+            nn.Linear(32, self.vocab.get_vocab_size(self._target_namespace))
+        )
+        self._label_loss_fn = CrossEntropyLoss()
+        self._qa_loss_fn = CrossEntropyLoss()
         metrics = metrics or {}
         metrics.update({
+            "label_accuracy": CategoricalAccuracy(),
             "start_accuracy": CategoricalAccuracy(),
             "end_accuracy": CategoricalAccuracy(),
-            "f1m": F1Measure(positive_label=1),
-            "span_f1": NerAsQaSpanF1()
+            "label_f1measure": FBetaMeasure(),
         })
         self.metrics = metrics
         initializer(self)
@@ -56,8 +55,9 @@ class NerAsQaModel(Model):
     def forward(
         self,
         context: TensorDict,  # [B , L , N]
-        answer_starts: Tensor = None,  # [B , L]
-        answer_ends: Tensor = None,  # [B , L]
+        answer_label: Tensor = None,  # [B]
+        answer_start: Tensor = None,  # [B , L]
+        answer_end: Tensor = None,  # [B , L]
         **kwargs,
     ) -> Dict:
         # B -- batch_size
@@ -65,35 +65,54 @@ class NerAsQaModel(Model):
         # N -- number of tokens in line
         # E -- token embedding dim
 
-        if answer_starts is None and answer_ends is not None:
+        if answer_start is None and answer_end is not None:
             raise RuntimeError(f'Answer start ans answer ends must be provided simultaneously')
-        if answer_ends is None and answer_starts is not None:
+        if answer_end is None and answer_start is not None:
             raise RuntimeError(f'Answer start ans answer ends must be provided simultaneously')
-        mask = get_text_field_mask(context)  # [B, L]
-        embeddings = self.word_embeddings(context)
-        batch_size = embeddings.size(1)
+        mask = get_text_field_mask(context)  # [B , L]
+        embeddings = self.word_embeddings(context)  # [B , N , E]
+        batch_size = embeddings.size(0)
+        num_tokens = embeddings.size(1)
         encoded_lines = self.encoder(embeddings, mask=mask)
-        start_logits = self.span_starts(encoded_lines)
-        end_logits = self.span_ends(encoded_lines)
+        # encoded lines has embeddings for [CLS] token and other tokens (query, [SEP] and context)
+        # we use different heads for them, so split this tensor to route its different parts
+        # for their respective heads
+        cls_embeddings, tokens_embeddings = encoded_lines.split([1, encoded_lines.size(1)-1], dim=1)
+        # cls_embeddings do not need spatial (or token-wise) dimension as they are
+        # intended for simple classification task
+        cls_embeddings.squeeze_(1)
+        start_logits = self.span_starts(tokens_embeddings)  # [B , N , 1]
+        end_logits = self.span_ends(tokens_embeddings)  # [B , N , 1]
+        start_logits = start_logits.squeeze(-1)  # [B , N]
+        end_logits = end_logits.squeeze(-1)  # [B , N]
 
+        label_logits = self.label_head(cls_embeddings)
         output = {
             "start_logits": start_logits,
             "end_logits": end_logits,
+            'label_logits': label_logits,
             "mask": mask,
+            **kwargs
         }
 
-        if answer_starts is not None:
+        if answer_start is not None and answer_label is not None:
 
             # for metric in self.metrics.values():
-            self.metrics['start_accuracy'](start_logits, answer_starts)
-            self.metrics['end_accuracy'](end_logits, answer_starts)
-            self.metrics["f1m"](start_logits, answer_starts)
-            self.metrics["f1m"](end_logits, answer_ends)
-            self.metrics['span_f1'](start_logits, end_logits, answer_starts, answer_ends, [meta['type'] for meta in kwargs['meta']])
-            start_loss = self._loss_fn(start_logits.view(-1, 2), answer_starts.flatten())
-            end_loss = self._loss_fn(end_logits.view(-1, 2), answer_ends.flatten())
-            loss = start_loss + end_loss
+            self.metrics['label_accuracy'](label_logits, answer_label)
+            self.metrics["label_f1measure"](label_logits, answer_label)
+
+            answer_start.clamp_(max=num_tokens - 2)
+            answer_end.clamp_(max=num_tokens - 2)
+            self.metrics['start_accuracy'](start_logits, answer_start.flatten())
+            self.metrics['end_accuracy'](end_logits, answer_end.flatten())
+            # self.metrics['span_f1'](start_logits, end_logits, answer_start, answer_end, [meta['type'] for meta in kwargs['meta']])
+            label_loss = self._label_loss_fn(label_logits, answer_label)
+            start_loss = self._qa_loss_fn(start_logits, answer_start.flatten())
+            end_loss = self._qa_loss_fn(end_logits, answer_end.flatten())
+            loss = label_loss / 10 + start_loss + end_loss
             output['loss'] = loss
+            output['label_loss'] = label_loss
+            output['qa_loss'] = start_loss + end_loss
         return output
 
     # def decode(self, output_dict: Dict[str, torch.Tensor]):

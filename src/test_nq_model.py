@@ -1,4 +1,5 @@
 # pylint: disable=invalid-name,protected-access
+import json
 import unittest
 from copy import deepcopy
 
@@ -9,8 +10,7 @@ from allennlp.common.testing import ModelTestCase
 from allennlp.common.checks import ConfigurationError
 from allennlp.common.params import Params
 from allennlp.models import Model
-from al2_implementation.ner_qa_model import NerAsQaModel
-from al2_implementation.ner_qa_reader import NerAsReadingComprehensionDatasetReader
+from src import NaturalQuestionsModel, NaturalQuestionsDatasetReader
 
 
 class SimpleRETest(ModelTestCase):
@@ -19,12 +19,18 @@ class SimpleRETest(ModelTestCase):
     def setUp(self):
         super().setUp()
         self.set_up_model(
-            "fixtures/ner_as_qa.jsonnet",
-            "./fixtures/ontonotes_v3_example.conll",
+            "fixtures/natural-questions-simplified.jsonnet",
+            "./fixtures/simplified-nq-sample.jsonl",
         )
 
-    def test_01_simple_tagger_can_train_save_and_load(self):
+    def test_01_simple_qa_can_train_save_and_load(self):
         self.ensure_model_can_train_save_and_load(self.param_file)
+
+    def test_01_simple_qa_can_train_save_and_load_stochastically(self):
+        overrides = json.dumps({
+            'dataset_reader.downsample_negative': 0.1
+        })
+        self.ensure_model_can_train_save_and_load(self.param_file, overrides=overrides)
 
     @flaky
     @pytest.mark.skip

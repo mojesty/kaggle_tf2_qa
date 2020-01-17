@@ -30,6 +30,25 @@ class TestNerQAReader(unittest.TestCase):
         # self.assertEqual(instances[2]['meta'].metadata['text'], instances[3]['meta'].metadata['text'])
         # self.assertNotEqual(instances[2]['meta'].metadata['query'], instances[3]['meta'].metadata['query'])
 
+    def test_01_downsamples_all_negatives(self):
+        reader = NaturalQuestionsDatasetReader(
+            downsample_negative=-0.1,
+        )
+
+        instances = reader.read('fixtures/simplified-nq-sample.jsonl')
+        instances = ensure_list(instances)
+        self.assertEqual(len(instances), 6)
+
+    def test_01_downsamples_some_negatives(self):
+        reader = NaturalQuestionsDatasetReader(
+            downsample_negative=0.1,
+        )
+
+        instances = reader.read('fixtures/simplified-nq-sample.jsonl')
+        instances = ensure_list(instances)
+        self.assertGreater(len(instances), 6)
+        self.assertLess(len(instances), 1125)
+
 
 if __name__ == '__main__':
     unittest.main()

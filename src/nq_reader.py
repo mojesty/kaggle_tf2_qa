@@ -22,6 +22,7 @@ class NaturalQuestionsDatasetReader(DatasetReader):
     def __init__(self,
                  skip_empty: bool = False,
                  downsample_negative: float = 0.05,
+                 downsample_all: float = 0.1,
                  simplified: bool = True,
                  skip_toplevel_answer_candidates: bool = True,
                  maxlen: int = 450,
@@ -38,6 +39,7 @@ class NaturalQuestionsDatasetReader(DatasetReader):
 
         self._downsample_negative = downsample_negative
         self._skip_toplevel_answer_candidates = skip_toplevel_answer_candidates
+        self._downsample_all = downsample_all
 
     def _read(self, file_path: str) -> Iterable[Instance]:
         with jsonlines.open(file_path) as reader:
@@ -54,6 +56,8 @@ class NaturalQuestionsDatasetReader(DatasetReader):
                 inst['annotations'] = inst['annotations'][0] if inst['annotations'] else None
 
                 if inst['annotations'] is not None:
+                    # training mode, get human annotations
+                    # and construct positive / negative examples
                     ann = inst['annotations']
                     correct_candidate_index = ann['long_answer']['candidate_index']
 
@@ -75,7 +79,8 @@ class NaturalQuestionsDatasetReader(DatasetReader):
 
                     for idx, candidate in enumerate(candidates):
                         context = tokenized_text[candidate['start_token']:candidate['end_token']][:self._maxlen]
-                        if idx != correct_candidate_index and random.uniform(0, 1) < self._downsample_negative:
+                        if idx != correct_candidate_index \
+                                and random.uniform(0, 1) < self._downsample_negative * self._downsample_all:
                             # negative example, we downsample it first
                             categorical_target = 'not_relevant'
                             yield self.text_to_instance(
@@ -84,10 +89,12 @@ class NaturalQuestionsDatasetReader(DatasetReader):
                                 categorical_target,
                                 -1,
                                 -1,
-                                example_id=inst['example_id']
+                                example_id=inst['example_id'],
+                                candidate_start_token=candidate['start_token']
                             )
-                        else:
-                            # positive example,
+                        elif idx == correct_candidate_index \
+                                and random.uniform(0, 1) < self._downsample_all:
+                            # positive example, downsample if necessary
                             categorical_target = yes_no_answer
                             yield self.text_to_instance(
                                 context,
@@ -95,8 +102,22 @@ class NaturalQuestionsDatasetReader(DatasetReader):
                                 categorical_target,
                                 answer_start_token,
                                 answer_end_token,
-                                example_id=inst['example_id']
+                                example_id=inst['example_id'],
+                                candidate_start_token=candidate['start_token']
                             )
+                        # when long answer is incorrect and we decided not to sample, do nothing
+                else:
+                    # inference mode, only answer candidates are present
+                    for idx, candidate in enumerate(candidates):
+                        yield self.text_to_instance(
+                            tokenized_text[candidate['start_token']:candidate['end_token']][:self._maxlen],
+                            tokenized_question,
+                            categorical_target=None,
+                            answer_start_token=None,
+                            answer_end_token=None,
+                            example_id=inst['example_id'],
+                            candidate_start_token=candidate['start_token']
+                        )
 
     def text_to_instance(self,
                          tokens: List[str],
@@ -129,16 +150,18 @@ class NaturalQuestionsDatasetReader(DatasetReader):
             + [Token('[SEP]')] + [Token(word) for word in tokens],
             self._token_indexers
         )
-        metadata.update({'text': tokens, 'query': query})
+        # offset does not count [CLS] token because we will split away its embeddings
+        offset = len(query) + 2
+        metadata.update({'text': tokens, 'query': query, 'offset': offset})
         fields = {
             'context': text_and_query_field,
             'meta': MetadataField(metadata)
         }
         # fields['answer_starts'] = IndexField(span_start, passage_field)
         if answer_start_token is not None and answer_end_token is not None:
-            fields['answer_start'] = IndexField(answer_start_token, sequence_field=text_and_query_field)
-            fields['answer_end'] = IndexField(answer_end_token, sequence_field=text_and_query_field)
-            fields['answer_label'] = LabelField(categorical_target)
+            fields['answer_start'] = IndexField(min(answer_start_token + offset, 430), sequence_field=text_and_query_field)
+            fields['answer_end'] = IndexField(min(answer_end_token + offset, 430), sequence_field=text_and_query_field)
+            fields['answer_label'] = LabelField(categorical_target, label_namespace='answer_labels')
         return Instance(fields)
 
 
