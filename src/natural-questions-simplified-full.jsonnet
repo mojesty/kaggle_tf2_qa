@@ -4,8 +4,22 @@ local bertname='bert-base-cased';
 {
   "dataset_reader": {
     "type": "natural_questions",
-    "downsample_negative": 0.05,
+    "downsample_negative": 0.02,
     "downsample_all": 0.01,
+    "lazy": true,
+    "token_indexers": {
+      "tokens": {
+        "type": "bert-pretrained",
+        "pretrained_model": bertname,
+        "use_starting_offsets": true,
+        "do_lowercase": false
+      },
+    }
+  },
+  "validation_dataset_reader": {
+    "type": "natural_questions",
+    "downsample_negative": 0.1,
+    "downsample_all": 1.1, // more than 1
     "lazy": true,
     "token_indexers": {
       "tokens": {
@@ -51,7 +65,7 @@ local bertname='bert-base-cased';
   },
   "iterator": {
     "type": "bucket",
-    "batch_size": 32,
+    "batch_size": 48,
     "sorting_keys": [["context", "num_tokens"]],
     "biggest_batch_first": true,
   },
@@ -64,7 +78,8 @@ local bertname='bert-base-cased';
       "type": "adam",
       "lr": 0.001
     },
-    "num_epochs": 100,
-    "patience": 20,
+    "num_serialized_models_to_keep": 5,
+    "num_epochs": 500,
+    "patience": 200,
   }
 }
